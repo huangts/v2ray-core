@@ -8,13 +8,13 @@ import (
 	"v2ray.com/core/common/serial"
 )
 
-// ChunkSizeDecoder is an utility class to decode size value from bytes.
+// ChunkSizeDecoder is a utility class to decode size value from bytes.
 type ChunkSizeDecoder interface {
 	SizeBytes() int
 	Decode([]byte) (uint16, error)
 }
 
-// ChunkSizeEncoder is an utility class to encode size value into bytes.
+// ChunkSizeEncoder is a utility class to encode size value into bytes.
 type ChunkSizeEncoder interface {
 	SizeBytes() int
 	Encode(uint16, []byte) []byte
@@ -62,7 +62,7 @@ type ChunkStreamReader struct {
 	reader      *buf.BufferedReader
 
 	buffer       []byte
-	leftOverSize int
+	leftOverSize int32
 }
 
 func NewChunkStreamReader(sizeDecoder ChunkSizeDecoder, reader io.Reader) *ChunkStreamReader {
@@ -90,7 +90,7 @@ func (r *ChunkStreamReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if nextSize == 0 {
 			return nil, io.EOF
 		}
-		size = int(nextSize)
+		size = int32(nextSize)
 	}
 	r.leftOverSize = size
 
