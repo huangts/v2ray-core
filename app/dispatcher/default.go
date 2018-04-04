@@ -44,17 +44,13 @@ func NewDefaultDispatcher(ctx context.Context, config *Config) (*DefaultDispatch
 	return d, nil
 }
 
-// Start implements app.Application.
+// Start implements common.Runnable.
 func (*DefaultDispatcher) Start() error {
 	return nil
 }
 
-// Close implements app.Application.
+// Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
-
-func getStatsName(u *protocol.User) string {
-	return "user>traffic>" + u.Email
-}
 
 func (d *DefaultDispatcher) getStatCounter(name string) core.StatCounter {
 	c := d.stats.GetCounter(name)
