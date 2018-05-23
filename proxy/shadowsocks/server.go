@@ -14,6 +14,7 @@ import (
 	"v2ray.com/core/proxy"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/udp"
+	"v2ray.com/core/transport/pipe"
 )
 
 type Server struct {
@@ -139,8 +140,8 @@ func (s *Server) handlerUDPPayload(ctx context.Context, conn internet.Connection
 func (s *Server) handleConnection(ctx context.Context, conn internet.Connection, dispatcher core.Dispatcher) error {
 	sessionPolicy := s.v.PolicyManager().ForLevel(s.user.Level)
 	conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake))
-	bufferedReader := buf.NewBufferedReader(buf.NewReader(conn))
-	request, bodyReader, err := ReadTCPSession(s.user, bufferedReader)
+	bufferedReader := buf.BufferedReader{Reader: buf.NewReader(conn)}
+	request, bodyReader, err := ReadTCPSession(s.user, &bufferedReader)
 	if err != nil {
 		log.Record(&log.AccessMessage{
 			From:   conn.RemoteAddr(),
@@ -152,7 +153,7 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	bufferedReader.SetBuffered(false)
+	bufferedReader.Direct = true
 
 	dest := request.Destination()
 	log.Record(&log.AccessMessage{
@@ -167,7 +168,7 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
-	ray, err := dispatcher.Dispatch(ctx, dest)
+	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err
 	}
@@ -182,7 +183,7 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 		}
 
 		{
-			payload, err := ray.InboundOutput().ReadMultiBuffer()
+			payload, err := link.Reader.ReadMultiBuffer()
 			if err != nil {
 				return err
 			}
@@ -195,7 +196,7 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 			return err
 		}
 
-		if err := buf.Copy(ray.InboundOutput(), responseWriter, buf.UpdateActivity(timer)); err != nil {
+		if err := buf.Copy(link.Reader, responseWriter, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transport all TCP response").Base(err)
 		}
 
@@ -204,9 +205,9 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		defer ray.InboundInput().Close()
+		defer common.Close(link.Writer)
 
-		if err := buf.Copy(bodyReader, ray.InboundInput(), buf.UpdateActivity(timer)); err != nil {
+		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transport all TCP request").Base(err)
 		}
 
@@ -214,8 +215,8 @@ func (s *Server) handleConnection(ctx context.Context, conn internet.Connection,
 	}
 
 	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
-		ray.InboundInput().CloseError()
-		ray.InboundOutput().CloseError()
+		pipe.CloseError(link.Reader)
+		pipe.CloseError(link.Writer)
 		return newError("connection ends").Base(err)
 	}
 

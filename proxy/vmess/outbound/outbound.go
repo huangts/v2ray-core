@@ -6,9 +6,12 @@ import (
 	"context"
 	"time"
 
+	"v2ray.com/core/transport/pipe"
+
 	"v2ray.com/core"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/functions"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/retry"
@@ -17,7 +20,6 @@ import (
 	"v2ray.com/core/proxy/vmess"
 	"v2ray.com/core/proxy/vmess/encoding"
 	"v2ray.com/core/transport/internet"
-	"v2ray.com/core/transport/ray"
 )
 
 // Handler is an outbound connection handler for VMess protocol.
@@ -42,7 +44,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 }
 
 // Process implements proxy.Outbound.Process().
-func (v *Handler) Process(ctx context.Context, outboundRay ray.OutboundRay, dialer proxy.Dialer) error {
+func (v *Handler) Process(ctx context.Context, link *core.Link, dialer proxy.Dialer) error {
 	var rec *protocol.ServerSpec
 	var conn internet.Connection
 
@@ -95,8 +97,8 @@ func (v *Handler) Process(ctx context.Context, outboundRay ray.OutboundRay, dial
 		request.Option.Set(protocol.RequestOptionChunkMasking)
 	}
 
-	input := outboundRay.OutboundInput()
-	output := outboundRay.OutboundOutput()
+	input := link.Reader
+	output := link.Writer
 
 	session := encoding.NewClientSession(protocol.DefaultIDHash)
 	sessionPolicy := v.v.PolicyManager().ForLevel(request.User.Level)
@@ -113,8 +115,8 @@ func (v *Handler) Process(ctx context.Context, outboundRay ray.OutboundRay, dial
 		}
 
 		bodyWriter := session.EncodeRequestBody(request, writer)
-		{
-			firstPayload, err := input.ReadTimeout(time.Millisecond * 500)
+		if tReader, ok := input.(*pipe.Reader); ok {
+			firstPayload, err := tReader.ReadMultiBufferWithTimeout(time.Millisecond * 500)
 			if err != nil && err != buf.ErrReadTimeout {
 				return newError("failed to get first payload").Base(err)
 			}
@@ -145,20 +147,20 @@ func (v *Handler) Process(ctx context.Context, outboundRay ray.OutboundRay, dial
 	responseDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
-		reader := buf.NewBufferedReader(buf.NewReader(conn))
+		reader := &buf.BufferedReader{Reader: buf.NewReader(conn)}
 		header, err := session.DecodeResponseHeader(reader)
 		if err != nil {
 			return newError("failed to read header").Base(err)
 		}
 		v.handleCommand(rec.Destination(), header.Command)
 
-		reader.SetBuffered(false)
+		reader.Direct = true
 		bodyReader := session.DecodeResponseBody(request, reader)
 
 		return buf.Copy(bodyReader, output, buf.UpdateActivity(timer))
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
+	if err := signal.ExecuteParallel(ctx, requestDone, functions.CloseOnSuccess(responseDone, functions.Close(output))); err != nil {
 		return newError("connection ends").Base(err)
 	}
 
