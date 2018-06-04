@@ -1,13 +1,13 @@
 package pipe_test
 
 import (
-	"context"
 	"io"
 	"testing"
 	"time"
 
+	"v2ray.com/core/common/task"
+
 	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/signal"
 	. "v2ray.com/core/transport/pipe"
 	. "v2ray.com/ext/assert"
 )
@@ -15,7 +15,7 @@ import (
 func TestPipeReadWrite(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -29,7 +29,7 @@ func TestPipeReadWrite(t *testing.T) {
 func TestPipeCloseError(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -44,7 +44,7 @@ func TestPipeCloseError(t *testing.T) {
 func TestPipeClose(t *testing.T) {
 	assert := With(t)
 
-	pReader, pWriter := New()
+	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
 	b := buf.New()
 	b.Write(payload)
@@ -68,7 +68,7 @@ func TestPipeLimitZero(t *testing.T) {
 	bb.Write([]byte{'a', 'b'})
 	assert(pWriter.WriteMultiBuffer(buf.NewMultiBufferValue(bb)), IsNil)
 
-	err := signal.ExecuteParallel(context.Background(), func() error {
+	err := task.Run(task.Parallel(func() error {
 		b := buf.New()
 		b.Write([]byte{'c', 'd'})
 		return pWriter.WriteMultiBuffer(buf.NewMultiBufferValue(b))
@@ -87,7 +87,7 @@ func TestPipeLimitZero(t *testing.T) {
 		}
 		assert(rb.String(), Equals, "cd")
 		return nil
-	})
+	}))()
 
 	assert(err, IsNil)
 }

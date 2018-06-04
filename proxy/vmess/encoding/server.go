@@ -19,7 +19,7 @@ import (
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/serial"
-	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/task"
 	"v2ray.com/core/proxy/vmess"
 )
 
@@ -33,7 +33,7 @@ type sessionId struct {
 type SessionHistory struct {
 	sync.RWMutex
 	cache map[sessionId]time.Time
-	task  *signal.PeriodicTask
+	task  *task.Periodic
 }
 
 // NewSessionHistory creates a new SessionHistory object.
@@ -41,7 +41,7 @@ func NewSessionHistory() *SessionHistory {
 	h := &SessionHistory{
 		cache: make(map[sessionId]time.Time, 128),
 	}
-	h.task = &signal.PeriodicTask{
+	h.task = &task.Periodic{
 		Interval: time.Second * 30,
 		Execute: func() error {
 			h.removeExpiredEntries()
@@ -176,7 +176,7 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader) (*protocol.Request
 		if invalidRequestErr != nil {
 			randomLen := dice.Roll(64) + 1
 			// Read random number of bytes for prevent detection.
-			common.Ignore(buffer.AppendSupplier(buf.ReadFullFrom(decryptor, int32(randomLen))), "Error doesn't matter")
+			buffer.AppendSupplier(buf.ReadFullFrom(decryptor, int32(randomLen))) // nolint: errcheck
 		}
 	}()
 

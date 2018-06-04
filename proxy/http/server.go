@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"v2ray.com/core/common/task"
+
 	"v2ray.com/core/transport/pipe"
 
 	"v2ray.com/core"
@@ -170,8 +172,11 @@ func (s *Server) handleConnect(ctx context.Context, request *http.Request, reade
 		return newError("failed to write back OK response").Base(err)
 	}
 
+	plcy := s.policy()
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, s.policy().Timeouts.ConnectionIdle)
+	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
+
+	ctx = core.ContextWithBufferPolicy(ctx, plcy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err
@@ -189,7 +194,6 @@ func (s *Server) handleConnect(ctx context.Context, request *http.Request, reade
 	}
 
 	requestDone := func() error {
-		defer common.Close(link.Writer)
 		defer timer.SetTimeout(s.policy().Timeouts.DownlinkOnly)
 
 		v2reader := buf.NewReader(conn)
@@ -207,7 +211,8 @@ func (s *Server) handleConnect(ctx context.Context, request *http.Request, reade
 		return nil
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
+	var closeWriter = task.Single(requestDone, task.OnSuccess(task.Close(link.Writer)))
+	if err := task.Run(task.WithContext(ctx), task.Parallel(closeWriter, responseDone))(); err != nil {
 		pipe.CloseError(link.Reader)
 		pipe.CloseError(link.Writer)
 		return newError("connection ends").Base(err)
@@ -303,7 +308,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		return nil
 	}
 
-	if err := signal.ExecuteParallel(ctx, requestDone, responseDone); err != nil {
+	if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDone))(); err != nil {
 		pipe.CloseError(link.Reader)
 		pipe.CloseError(link.Writer)
 		return newError("connection ends").Base(err)
