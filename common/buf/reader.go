@@ -7,28 +7,12 @@ import (
 	"v2ray.com/core/common/errors"
 )
 
-// BytesToBufferReader is a Reader that adjusts its reading speed automatically.
-type BytesToBufferReader struct {
-	io.Reader
-	buffer []byte
-}
-
-// NewBytesToBufferReader returns a new BytesToBufferReader.
-func NewBytesToBufferReader(reader io.Reader) Reader {
-	return &BytesToBufferReader{
-		Reader: reader,
-	}
-}
-
-func (r *BytesToBufferReader) readSmall() (MultiBuffer, error) {
+func readOneUDP(r io.Reader) (*Buffer, error) {
 	b := New()
 	for i := 0; i < 64; i++ {
-		err := b.Reset(ReadFrom(r.Reader))
-		if b.IsFull() && largeSize > Size {
-			r.buffer = newBytes(Size + 1)
-		}
+		_, err := b.ReadFrom(r)
 		if !b.IsEmpty() {
-			return NewMultiBufferValue(b), nil
+			return b, nil
 		}
 		if err != nil {
 			b.Release()
@@ -36,41 +20,36 @@ func (r *BytesToBufferReader) readSmall() (MultiBuffer, error) {
 		}
 	}
 
+	b.Release()
 	return nil, newError("Reader returns too many empty payloads.")
 }
 
-func (r *BytesToBufferReader) freeBuffer() {
-	freeBytes(r.buffer)
-	r.buffer = nil
-}
-
-// ReadMultiBuffer implements Reader.
-func (r *BytesToBufferReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.buffer == nil || largeSize == Size {
-		return r.readSmall()
-	}
-
-	nBytes, err := r.Reader.Read(r.buffer)
-	if nBytes > 0 {
-		mb := NewMultiBufferCap(int32(nBytes/Size) + 1)
-		common.Must2(mb.Write(r.buffer[:nBytes]))
-		if nBytes == len(r.buffer) && nBytes < int(largeSize) {
-			freeBytes(r.buffer)
-			r.buffer = newBytes(int32(nBytes) + 1)
-		} else if nBytes < Size {
-			r.freeBuffer()
-		}
-		return mb, nil
-	}
-
-	r.freeBuffer()
-
+// ReadBuffer reads a Buffer from the given reader, without allocating large buffer in advance.
+func ReadBuffer(r io.Reader) (*Buffer, error) {
+	// Use an one-byte buffer to wait for incoming payload.
+	var firstByte [1]byte
+	nBytes, err := r.Read(firstByte[:])
 	if err != nil {
 		return nil, err
 	}
 
-	// Read() returns empty payload and nil err. We don't expect this to happen, but just in case.
-	return r.readSmall()
+	b := New()
+	if nBytes > 0 {
+		common.Must(b.WriteByte(firstByte[0]))
+	}
+	for i := 0; i < 64; i++ {
+		_, err := b.ReadFrom(r)
+		if !b.IsEmpty() {
+			return b, nil
+		}
+		if err != nil {
+			b.Release()
+			return nil, err
+		}
+	}
+
+	b.Release()
+	return nil, newError("Reader returns too many empty payloads.")
 }
 
 // BufferedReader is a Reader that keeps its internal buffer.
@@ -79,8 +58,6 @@ type BufferedReader struct {
 	Reader Reader
 	// Buffer is the internal buffer to be read from first
 	Buffer MultiBuffer
-	// Direct indicates whether or not to use the internal buffer
-	Direct bool
 }
 
 // BufferedBytes returns the number of bytes that is cached in this reader.
@@ -97,35 +74,30 @@ func (r *BufferedReader) ReadByte() (byte, error) {
 
 // Read implements io.Reader. It reads from internal buffer first (if available) and then reads from the underlying reader.
 func (r *BufferedReader) Read(b []byte) (int, error) {
-	if r.Buffer != nil {
-		nBytes, _ := r.Buffer.Read(b)
+	if !r.Buffer.IsEmpty() {
+		buffer, nBytes := SplitBytes(r.Buffer, b)
+		r.Buffer = buffer
 		if r.Buffer.IsEmpty() {
-			r.Buffer.Release()
 			r.Buffer = nil
 		}
 		return nBytes, nil
 	}
 
-	if r.Direct {
-		if reader, ok := r.Reader.(io.Reader); ok {
-			return reader.Read(b)
-		}
+	mb, err := r.Reader.ReadMultiBuffer()
+	if err != nil {
+		return 0, err
 	}
 
-	mb, err := r.Reader.ReadMultiBuffer()
-	if mb != nil {
-		nBytes, _ := mb.Read(b)
-		if !mb.IsEmpty() {
-			r.Buffer = mb
-		}
-		return nBytes, err
+	mb, nBytes := SplitBytes(mb, b)
+	if !mb.IsEmpty() {
+		r.Buffer = mb
 	}
-	return 0, err
+	return nBytes, nil
 }
 
 // ReadMultiBuffer implements Reader.
 func (r *BufferedReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.Buffer != nil {
+	if !r.Buffer.IsEmpty() {
 		mb := r.Buffer
 		r.Buffer = nil
 		return mb, nil
@@ -136,7 +108,7 @@ func (r *BufferedReader) ReadMultiBuffer() (MultiBuffer, error) {
 
 // ReadAtMost returns a MultiBuffer with at most size.
 func (r *BufferedReader) ReadAtMost(size int32) (MultiBuffer, error) {
-	if r.Buffer == nil {
+	if r.Buffer.IsEmpty() {
 		mb, err := r.Reader.ReadMultiBuffer()
 		if mb.IsEmpty() && err != nil {
 			return nil, err
@@ -144,7 +116,8 @@ func (r *BufferedReader) ReadAtMost(size int32) (MultiBuffer, error) {
 		r.Buffer = mb
 	}
 
-	mb := r.Buffer.SliceBySize(size)
+	rb, mb := SplitSize(r.Buffer, size)
+	r.Buffer = rb
 	if r.Buffer.IsEmpty() {
 		r.Buffer = nil
 	}
@@ -153,27 +126,17 @@ func (r *BufferedReader) ReadAtMost(size int32) (MultiBuffer, error) {
 
 func (r *BufferedReader) writeToInternal(writer io.Writer) (int64, error) {
 	mbWriter := NewWriter(writer)
-	totalBytes := int64(0)
+	var sc SizeCounter
 	if r.Buffer != nil {
-		totalBytes += int64(r.Buffer.Len())
+		sc.Size = int64(r.Buffer.Len())
 		if err := mbWriter.WriteMultiBuffer(r.Buffer); err != nil {
 			return 0, err
 		}
 		r.Buffer = nil
 	}
 
-	for {
-		mb, err := r.Reader.ReadMultiBuffer()
-		if mb != nil {
-			totalBytes += int64(mb.Len())
-			if werr := mbWriter.WriteMultiBuffer(mb); werr != nil {
-				return totalBytes, err
-			}
-		}
-		if err != nil {
-			return totalBytes, err
-		}
-	}
+	err := Copy(r.Reader, mbWriter, CountSize(&sc))
+	return sc.Size, err
 }
 
 // WriteTo implements io.WriterTo.
@@ -188,7 +151,36 @@ func (r *BufferedReader) WriteTo(writer io.Writer) (int64, error) {
 // Close implements io.Closer.
 func (r *BufferedReader) Close() error {
 	if !r.Buffer.IsEmpty() {
-		r.Buffer.Release()
+		ReleaseMulti(r.Buffer)
+		r.Buffer = nil
 	}
 	return common.Close(r.Reader)
+}
+
+// SingleReader is a Reader that read one Buffer every time.
+type SingleReader struct {
+	io.Reader
+}
+
+// ReadMultiBuffer implements Reader.
+func (r *SingleReader) ReadMultiBuffer() (MultiBuffer, error) {
+	b, err := ReadBuffer(r.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return MultiBuffer{b}, nil
+}
+
+// PacketReader is a Reader that read one Buffer every time.
+type PacketReader struct {
+	io.Reader
+}
+
+// ReadMultiBuffer implements Reader.
+func (r *PacketReader) ReadMultiBuffer() (MultiBuffer, error) {
+	b, err := readOneUDP(r.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return MultiBuffer{b}, nil
 }
